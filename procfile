@@ -1,1 +1,1 @@
-"worker: python NasusScanBot.py" 
+worker: python your_script_name.py
