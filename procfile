@@ -1,1 +1,1 @@
-worker: python NasusScanBot.py
+worker: python bot.py
