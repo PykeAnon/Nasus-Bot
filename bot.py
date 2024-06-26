@@ -1,19 +1,20 @@
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.constants import ParseMode
 from telegram.ext import Application, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import httpx
 from dotenv import load_dotenv
 import os
 import base58
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 import html
+from collections import defaultdict
 
-# Load environment variables from .env file
+
 load_dotenv()
 
-# Enable logging
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -21,11 +22,14 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Define API URLs
+
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search/?q="
 
+# Dictionary to store tracked contracts and their initial market caps
+tracked_contracts = defaultdict(lambda: {"initial_market_cap": None, "last_alerted_cap": None, "pin_message_id": None, "chat_id": None})
+
 def is_valid_base58(address: str) -> bool:
-    if len(address) in range(32, 45):  # Solana addresses typically range from 32 to 44 characters
+    if len(address) in range(32, 45):  
         try:
             base58.b58decode(address)
             return True
@@ -64,8 +68,8 @@ def format_number(number) -> str:
 
 def calculate_age(pair_created_at: int) -> str:
     if pair_created_at:
-        creation_date = datetime.utcfromtimestamp(pair_created_at / 1000)
-        age = datetime.utcnow() - creation_date
+        creation_date = datetime.fromtimestamp(pair_created_at / 1000, tz=timezone.utc)
+        age = datetime.now(tz=timezone.utc) - creation_date
         if age.days > 365:
             years = age.days // 365
             months = (age.days % 365) // 30
@@ -89,9 +93,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not is_contract_address(message_text):
         return  # Ignore the message if it doesn't contain a valid contract address
     
-    await send_token_info(update, context, message_text)
+    await send_token_info(update=update, context=context, contract_address=message_text)
 
-async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, contract_address: str) -> None:
+async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, contract_address: str, is_refresh=False) -> None:
     info_data = await get_dexscreener_token_info(contract_address)
     
     if info_data and 'pairs' in info_data and info_data['pairs']:
@@ -151,49 +155,152 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             f"<a href='{dextools_url}'><b>DexTools</b></a> | "
             f"<a href='{solscan_url}'><b>Solscan</b></a>\n"
         )
-        # Create the inline keyboard
+        
+        track_button_label = "✅ Track" if tracked_contracts[contract_address]["initial_market_cap"] else "❌ Track"
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("Refresh Data", callback_data=contract_address)]]
+            [
+                [InlineKeyboardButton("Refresh Data", callback_data=f"refresh_{contract_address}"),
+                 InlineKeyboardButton(track_button_label, callback_data=f"toggle_{contract_address}")]
+            ]
         )
+
+        if is_refresh:
+            await context.bot.edit_message_text(
+                chat_id=update.message.chat_id, message_id=update.message.message_id, text="Refreshing data...",
+                parse_mode=ParseMode.HTML
+            )
+            await asyncio.sleep(2)
+            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=update.message.message_id)
+            await context.bot.send_message(
+                chat_id=update.message.chat_id, text=response_message, parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True, reply_markup=keyboard
+            )
+        else:
+            sent_message = await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
+            return sent_message.message_id, update.message.chat_id
     else:
         response_message = "Unknown contract address or unavailable at this time."
-        keyboard = None
-
-    await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
+        if update:
+            await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    contract_address = query.data
+    contract_address = query.data.split('_')[1]
 
-    # Edit the message to indicate refreshing data
-    refreshing_message = await query.edit_message_text("Refreshing data...", parse_mode=ParseMode.HTML)
-    
-    # Send the updated token information
-    await send_token_info(query, context, contract_address)
-    
-    # Delete the "Refreshing data..." message
-    try:
-        await context.bot.delete_message(chat_id=refreshing_message.chat_id, message_id=refreshing_message.message_id)
-    except Exception as e:
-        logger.error(f"Failed to delete the refreshing message: {e}")
+    # Refresh the data and delete the old message
+    await send_token_info(update=query, context=context, contract_address=contract_address, is_refresh=True)
+
+async def toggle_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    contract_address = query.data.split('_')[1]
+
+    user_id = query.from_user.id
+    chat_id = query.message.chat_id
+
+    member = await context.bot.get_chat_member(chat_id, user_id)
+    if member.status not in [ChatMember.ADMINISTRATOR, ChatMember.OWNER]:
+        no_permission_message = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text="You do not have permission to add to the Track List.",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(10)
+        await context.bot.delete_message(chat_id=no_permission_message.chat_id, message_id=no_permission_message.message_id)
+        return
+
+    if tracked_contracts[contract_address]["initial_market_cap"] is None:
+        info_data = await get_dexscreener_token_info(contract_address)
+        if info_data and 'pairs' in info_data and info_data['pairs']:
+            market_cap = float(info_data['pairs'][0].get('fdv', 0))
+            tracked_contracts[contract_address]["initial_market_cap"] = market_cap
+            tracked_contracts[contract_address]["last_alerted_cap"] = market_cap
+            tracked_contracts[contract_address]["pin_message_id"] = query.message.message_id
+            tracked_contracts[contract_address]["chat_id"] = query.message.chat_id
+            await context.bot.pin_chat_message(chat_id=query.message.chat_id, message_id=query.message.message_id)
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("Refresh Data", callback_data=f"refresh_{contract_address}"),
+                         InlineKeyboardButton("✅ Track", callback_data=f"toggle_{contract_address}")]
+                    ]
+                )
+            )
+    else:
+        pin_message_id = tracked_contracts[contract_address]["pin_message_id"]
+        chat_id = tracked_contracts[contract_address]["chat_id"]
+        tracked_contracts[contract_address] = {"initial_market_cap": None, "last_alerted_cap": None, "pin_message_id": None, "chat_id": None}
+        await context.bot.unpin_chat_message(chat_id=chat_id, message_id=pin_message_id)
+        stop_message = await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"Stopped tracking {contract_address}.",
+            parse_mode=ParseMode.HTML
+        )
+        await asyncio.sleep(5)
+        await context.bot.delete_message(chat_id=stop_message.chat_id, message_id=stop_message.message_id)
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("Refresh Data", callback_data=f"refresh_{contract_address}"),
+                     InlineKeyboardButton("❌ Track", callback_data=f"toggle_{contract_address}")]
+                ]
+            )
+        )
+
+async def check_tracked_contracts(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for contract_address, data in tracked_contracts.items():
+        if data["initial_market_cap"] is None:
+            continue
+
+        info_data = await get_dexscreener_token_info(contract_address)
+        if info_data and 'pairs' in info_data and info_data['pairs']:
+            current_market_cap = float(info_data['pairs'][0].get('fdv', 0))
+            initial_market_cap = data["initial_market_cap"]
+            last_alerted_cap = data["last_alerted_cap"]
+
+            if abs(current_market_cap - last_alerted_cap) / last_alerted_cap >= 0.10:
+                message = f"Market Cap Alert for {contract_address}: ${current_market_cap:,.2f}"
+                await context.bot.send_message(chat_id=data["chat_id"], text=message)
+                tracked_contracts[contract_address]["last_alerted_cap"] = current_market_cap
+
+                # Unpin the old message and pin the new message only if the contract is being tracked
+                await context.bot.unpin_chat_message(chat_id=data["chat_id"], message_id=data["pin_message_id"])
+                pin_message_id, chat_id = await send_token_info(update=None, context=context, contract_address=contract_address)
+                if pin_message_id:
+                    await context.bot.pin_chat_message(chat_id=chat_id, message_id=pin_message_id)
+                    tracked_contracts[contract_address]["pin_message_id"] = pin_message_id
 
 def main() -> None:
     """Start the bot."""
-    # Load the token from the environment variable
-    token = os.getenv('TELEGRAM_BOT_API_TOKEN')
+    try:
+        
+        token = os.getenv('TELEGRAM_BOT_API_TOKEN')
 
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(token).build()
+        if not token:
+            logger.error("No TELEGRAM_BOT_API_TOKEN found in environment variables.")
+            return
 
-    # Handle messages that are contract addresses or mention the bot
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+        
+        application = Application.builder().token(token).build()
 
-    # Handle the callback for refreshing data
-    application.add_handler(CallbackQueryHandler(refresh_data))
+        # Handle messages that are contract addresses or mention the bot
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Start the Bot
-    application.run_polling()
+        # callback for refreshing data
+        application.add_handler(CallbackQueryHandler(refresh_data, pattern=r"refresh_"))
+
+        # callback for tracking data
+        application.add_handler(CallbackQueryHandler(toggle_tracking, pattern=r"toggle_"))
+
+        # Schedule a job to check the tracked contracts periodically
+        job_queue = application.job_queue
+        job_queue.run_repeating(check_tracked_contracts, interval=30, first=10)
+
+
+        application.run_polling()
+    except Exception as e:
+        logger.exception("An error occurred while starting the bot:")
 
 if __name__ == '__main__':
     main()
