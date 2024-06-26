@@ -95,7 +95,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     await send_token_info(update=update, context=context, contract_address=message_text)
 
-async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, contract_address: str, is_refresh=False) -> None:
+async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, contract_address: str, is_refresh=False, chat_id=None, message_id=None) -> None:
     info_data = await get_dexscreener_token_info(contract_address)
     
     if info_data and 'pairs' in info_data and info_data['pairs']:
@@ -155,7 +155,7 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             f"<a href='{dextools_url}'><b>DexTools</b></a> | "
             f"<a href='{solscan_url}'><b>Solscan</b></a>\n"
         )
-        
+        # Create the inline keyboard
         track_button_label = "✅ Track" if tracked_contracts[contract_address]["initial_market_cap"] else "❌ Track"
         keyboard = InlineKeyboardMarkup(
             [
@@ -166,15 +166,16 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
 
         if is_refresh:
             await context.bot.edit_message_text(
-                chat_id=update.message.chat_id, message_id=update.message.message_id, text="Refreshing data...",
+                chat_id=chat_id, message_id=message_id, text="Refreshing data...",
                 parse_mode=ParseMode.HTML
             )
             await asyncio.sleep(2)
-            await context.bot.delete_message(chat_id=update.message.chat_id, message_id=update.message.message_id)
-            await context.bot.send_message(
-                chat_id=update.message.chat_id, text=response_message, parse_mode=ParseMode.HTML,
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            sent_message = await context.bot.send_message(
+                chat_id=chat_id, text=response_message, parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True, reply_markup=keyboard
             )
+            return sent_message.message_id, chat_id
         else:
             sent_message = await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
             return sent_message.message_id, update.message.chat_id
@@ -189,7 +190,7 @@ async def refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     contract_address = query.data.split('_')[1]
 
     # Refresh the data and delete the old message
-    await send_token_info(update=query, context=context, contract_address=contract_address, is_refresh=True)
+    await send_token_info(update=query, context=context, contract_address=contract_address, is_refresh=True, chat_id=query.message.chat_id, message_id=query.message.message_id)
 
 async def toggle_tracking(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -259,14 +260,20 @@ async def check_tracked_contracts(context: ContextTypes.DEFAULT_TYPE) -> None:
             initial_market_cap = data["initial_market_cap"]
             last_alerted_cap = data["last_alerted_cap"]
 
-            if abs(current_market_cap - last_alerted_cap) / last_alerted_cap >= 0.10:
-                message = f"Market Cap Alert for {contract_address}: ${current_market_cap:,.2f}"
-                await context.bot.send_message(chat_id=data["chat_id"], text=message)
+            # Price action condition changed to 1%
+            if abs(current_market_cap - last_alerted_cap) / last_alerted_cap >= 0.01:
+                direction = "up" if current_market_cap > last_alerted_cap else "down"
+                percentage_change = ((current_market_cap - last_alerted_cap) / last_alerted_cap) * 100
+                message = (
+                    f"Market Cap Alert for <a href='https://t.me/share/url?url={contract_address}'>{contract_address}</a>: "
+                    f"{direction} by {percentage_change:.2f}%"
+                )
+                await context.bot.send_message(chat_id=data["chat_id"], text=message, parse_mode=ParseMode.HTML)
                 tracked_contracts[contract_address]["last_alerted_cap"] = current_market_cap
 
                 # Unpin the old message and pin the new message only if the contract is being tracked
                 await context.bot.unpin_chat_message(chat_id=data["chat_id"], message_id=data["pin_message_id"])
-                pin_message_id, chat_id = await send_token_info(update=None, context=context, contract_address=contract_address)
+                pin_message_id, chat_id = await send_token_info(update=None, context=context, contract_address=contract_address, is_refresh=True, chat_id=data["chat_id"], message_id=data["pin_message_id"])
                 if pin_message_id:
                     await context.bot.pin_chat_message(chat_id=chat_id, message_id=pin_message_id)
                     tracked_contracts[contract_address]["pin_message_id"] = pin_message_id
@@ -274,7 +281,7 @@ async def check_tracked_contracts(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     """Start the bot."""
     try:
-        
+      
         token = os.getenv('TELEGRAM_BOT_API_TOKEN')
 
         if not token:
@@ -296,7 +303,6 @@ def main() -> None:
         # Schedule a job to check the tracked contracts periodically
         job_queue = application.job_queue
         job_queue.run_repeating(check_tracked_contracts, interval=30, first=10)
-
 
         application.run_polling()
     except Exception as e:
