@@ -14,7 +14,7 @@ from collections import defaultdict
 
 load_dotenv()
 
-
+# Enable logging
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -175,6 +175,12 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
                 chat_id=chat_id, text=response_message, parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True, reply_markup=keyboard
             )
+
+            # Re-pin the message if the contract is being tracked
+            if tracked_contracts[contract_address]["initial_market_cap"] is not None:
+                await context.bot.pin_chat_message(chat_id=chat_id, message_id=sent_message.message_id)
+                tracked_contracts[contract_address]["pin_message_id"] = sent_message.message_id
+
             return sent_message.message_id, chat_id
         else:
             sent_message = await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
@@ -281,14 +287,14 @@ async def check_tracked_contracts(context: ContextTypes.DEFAULT_TYPE) -> None:
 def main() -> None:
     """Start the bot."""
     try:
-      
+        
         token = os.getenv('TELEGRAM_BOT_API_TOKEN')
 
         if not token:
             logger.error("No TELEGRAM_BOT_API_TOKEN found in environment variables.")
             return
 
-        
+        # Create the Application and pass it your bot's token.
         application = Application.builder().token(token).build()
 
         # Handle messages that are contract addresses or mention the bot
