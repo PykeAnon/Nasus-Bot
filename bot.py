@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 import html
 from collections import defaultdict
 
-
 load_dotenv()
 
 # Enable logging
@@ -22,14 +21,14 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-
 DEXSCREENER_API_URL = "https://api.dexscreener.com/latest/dex/search/?q="
+PUMPFUN_API_URL = "https://frontend-api.pump.fun/coins/"
 
 # Dictionary to store tracked contracts and their initial market caps
 tracked_contracts = defaultdict(lambda: {"initial_market_cap": None, "last_alerted_cap": None, "pin_message_id": None, "chat_id": None})
 
 def is_valid_base58(address: str) -> bool:
-    if len(address) in range(32, 45):  
+    if len(address) in range(32, 45):
         try:
             base58.b58decode(address)
             return True
@@ -57,12 +56,26 @@ async def get_dexscreener_token_info(contract_address: str) -> dict:
     url = f"{DEXSCREENER_API_URL}{contract_address}"
     return await fetch_data(url)
 
+async def get_pumpfun_token_info(contract_address: str) -> dict:
+    url = f"{PUMPFUN_API_URL}{contract_address}"
+    return await fetch_data(url)
+
 def format_price_change(change: float) -> str:
     return f"🟢{change:.2f}%" if change > 0 else f"🔴{change:.2f}%" if change < 0 else f"{change:.2f}%"
 
-def format_number(number) -> str:
+def format_number(number, is_buy_sell=False) -> str:
     try:
-        return f"{float(number):,.2f}" if number is not None else 'N/A'
+        number = float(number)
+        if is_buy_sell and number < 1000:
+            return f"{int(number)}"
+        elif number >= 1_000_000_000:
+            return f"{number / 1_000_000_000:.2f}B"
+        elif number >= 1_000_000:
+            return f"{number / 1_000_000:.2f}M"
+        elif number >= 1_000:
+            return f"{number / 1_000:.2f}K"
+        else:
+            return f"{number:.2f}"
     except (ValueError, TypeError):
         return 'N/A'
 
@@ -86,45 +99,51 @@ def calculate_age(pair_created_at: int) -> str:
             return f"{hours} hour(s), {minutes} minute(s)"
     return 'N/A'
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message_text = update.message.text.strip()
+def safe_html_escape(s: str) -> str:
+    return html.escape(s or 'N/A')
 
-    # Check if the message contains a valid contract address
-    if not is_contract_address(message_text):
-        return  # Ignore the message if it doesn't contain a valid contract address
-    
-    await send_token_info(update=update, context=context, contract_address=message_text)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.message and update.message.text:
+        message_text = update.message.text.strip()
+
+        # Check if the message contains a valid contract address
+        if not is_contract_address(message_text):
+            return  # Ignore the message if it doesn't contain a valid contract address
+        
+        await send_token_info(update=update, context=context, contract_address=message_text)
 
 async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, contract_address: str, is_refresh=False, chat_id=None, message_id=None) -> None:
     info_data = await get_dexscreener_token_info(contract_address)
     
     if info_data and 'pairs' in info_data and info_data['pairs']:
         info = info_data['pairs'][0]
-        chain_name = html.escape(info.get('chainId', 'N/A').capitalize())
+        chain_name = safe_html_escape(info.get('chainId', 'N/A').capitalize())
         base_token = info.get('baseToken', {})
         quote_token = info.get('quoteToken', {})
         market_data = info.get('priceChange', {})
         liquidity = info.get('liquidity', {})
+        volume_5m = format_number(info.get('volume', {}).get('m5', 'N/A'))
+        volume_1h = format_number(info.get('volume', {}).get('h1', 'N/A'))
         volume_24h = format_number(info.get('volume', {}).get('h24', 'N/A'))
         fdv = format_number(info.get('fdv', 'N/A'))
         txns = info.get('txns', {})
         pair_created_at = info.get('pairCreatedAt', 0)
-        chart_url = html.escape(info.get('url', ''))
+        chart_url = safe_html_escape(info.get('url', ''))
 
-        buys_5m = html.escape(str(txns.get('m5', {}).get('buys', 'N/A')))
-        sells_5m = html.escape(str(txns.get('m5', {}).get('sells', 'N/A')))
-        buys_1h = html.escape(str(txns.get('h1', {}).get('buys', 'N/A')))
-        sells_1h = html.escape(str(txns.get('h1', {}).get('sells', 'N/A')))
-        buys_24h = html.escape(str(txns.get('h24', {}).get('buys', 'N/A')))
-        sells_24h = html.escape(str(txns.get('h24', {}).get('sells', 'N/A')))
-        
-        token_symbol = html.escape(base_token.get('symbol', 'N/A'))
+        buys_5m = safe_html_escape(format_number(txns.get('m5', {}).get('buys', 'N/A'), is_buy_sell=True))
+        sells_5m = safe_html_escape(format_number(txns.get('m5', {}).get('sells', 'N/A'), is_buy_sell=True))
+        buys_1h = safe_html_escape(format_number(txns.get('h1', {}).get('buys', 'N/A'), is_buy_sell=True))
+        sells_1h = safe_html_escape(format_number(txns.get('h1', {}).get('sells', 'N/A'), is_buy_sell=True))
+        buys_24h = safe_html_escape(format_number(txns.get('h24', {}).get('buys', 'N/A'), is_buy_sell=True))
+        sells_24h = safe_html_escape(format_number(txns.get('h24', {}).get('sells', 'N/A'), is_buy_sell=True))
+
+        token_symbol = safe_html_escape(base_token.get('symbol', 'N/A'))
         
         price_change_1h = market_data.get('h1', 0.0)
         price_change_6h = market_data.get('h6', 0.0)
         price_change_24h = market_data.get('h24', 0.0)
         
-        pair_age = html.escape(calculate_age(pair_created_at))
+        pair_age = safe_html_escape(calculate_age(pair_created_at))
 
         dextools_url = f"https://www.dextools.io/app/{chain_name.lower()}/pair-explorer/{contract_address}"
         solscan_url = f"https://solscan.io/token/{contract_address}"
@@ -132,21 +151,16 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         response_message = (
             f"<b>Network:</b> {chain_name}\n"
             f"\n"
-            f"<b>Token Name:</b> {html.escape(base_token.get('name', 'N/A'))}\n"
-            f"<b>Symbol:</b> {token_symbol}\n"
-            f"<b>Current Price (USD):</b> ${html.escape(str(info.get('priceUsd', 'N/A')))}\n"
-            f"<b>Market Cap (USD):</b> ${fdv}\n"
-            f"<b>Liquidity (USD):</b> ${format_number(liquidity.get('usd'))}\n"
-            f"<b>Age:</b> {pair_age}\n"
+            f"<b>{safe_html_escape(base_token.get('name', 'N/A'))}</b> | <b>${token_symbol}</b>\n\n"
+            f"<b>💲 Price (USD):</b> ${safe_html_escape(str(info.get('priceUsd', 'N/A')))}\n"
+            f"<b>💰 MC (USD):</b> ${fdv}\n"
+            f"<b>💧 Liq (USD):</b> ${format_number(liquidity.get('usd'))}\n"
+            f"<b>🕒 Age:</b> {pair_age}\n"
             f"\n"
-            f"<b>Buys/Sells (5m):</b> {buys_5m}/{sells_5m}\n"
-            f"<b>Buys/Sells (1h):</b> {buys_1h}/{sells_1h}\n"
-            f"<b>Buys/Sells (24h):</b> {buys_24h}/{sells_24h}\n"
-            f"<b>24h Volume (USD):</b> ${volume_24h}\n"
+            f"<b>🔄 B/S: 5m:</b> {buys_5m}/{sells_5m} | <b>1h:</b> {buys_1h}/{sells_1h} | <b>24h:</b> {buys_24h}/{sells_24h}\n"
+            f"<b>📊 Volume (USD): 5m:</b> ${volume_5m} | <b>1h:</b> ${volume_1h} | <b>24h:</b> ${volume_24h}\n"
             f"\n"
-            f"<b>Price Change (1h):</b> {format_price_change(price_change_1h)}\n"
-            f"<b>Price Change (6h):</b> {format_price_change(price_change_6h)}\n"
-            f"<b>Price Change (24h):</b> {format_price_change(price_change_24h)}\n"
+            f"<b>📈 % Change: 1h:</b> {format_price_change(price_change_1h)} | <b>6h:</b> {format_price_change(price_change_6h)} | <b>24h:</b> {format_price_change(price_change_24h)}\n"
             f"\n"
             f"<a href='https://t.me/share/url?url={contract_address}'><code>{contract_address}</code></a>"
             f"\n"
@@ -186,8 +200,41 @@ async def send_token_info(update: Update, context: ContextTypes.DEFAULT_TYPE, co
             sent_message = await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True, reply_markup=keyboard)
             return sent_message.message_id, update.message.chat_id
     else:
-        response_message = "Unknown contract address or unavailable at this time."
-        if update:
+        # Try to fetch data from Pump.fun API
+        pumpfun_data = await get_pumpfun_token_info(contract_address)
+        if pumpfun_data:
+            name = safe_html_escape(pumpfun_data.get('name', 'N/A'))
+            mint = safe_html_escape(pumpfun_data.get('mint', 'N/A'))
+            symbol = safe_html_escape(pumpfun_data.get('symbol', 'N/A'))
+            description = safe_html_escape(pumpfun_data.get('description', 'N/A'))
+            twitter = safe_html_escape(pumpfun_data.get('twitter', 'N/A'))
+            telegram = safe_html_escape(pumpfun_data.get('telegram', 'N/A'))
+            website = safe_html_escape(pumpfun_data.get('website', '') or 'N/A')
+            market_cap = format_number(pumpfun_data.get('usd_market_cap', 'N/A'))
+            pumpfun_url = f"https://pump.fun/{contract_address}"
+
+            social_links = []
+            if twitter != 'N/A':
+                social_links.append(f"<a href='{twitter}'>Twitter</a>")
+            if telegram != 'N/A':
+                social_links.append(f"<a href='{telegram}'>Telegram</a>")
+            if website != 'N/A':
+                social_links.append(f"<a href='{website}'>Website</a>")
+            social_links_str = " | ".join(social_links)
+
+            response_message = (
+                f"<b>{name}</b> | <b>${symbol}</b>\n\n"
+                f"📝<b>Description:</b> {description}\n"
+                f"💰<b>MC (USD):</b> ${market_cap}\n\n"
+                f"🌐<b>Socials:</b> {social_links_str}\n\n"
+                f"<code>{mint}</code>\n"
+                f"\n"
+                f"<a href='{pumpfun_url}'><b>Pump.fun</b></a>\n"
+            )
+
+            await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+        else:
+            response_message = "Unknown contract address or unavailable at this time."
             await update.message.reply_text(response_message, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 async def refresh_data(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,7 +314,7 @@ async def check_tracked_contracts(context: ContextTypes.DEFAULT_TYPE) -> None:
             last_alerted_cap = data["last_alerted_cap"]
 
             # Price action condition changed to 1%
-            if abs(current_market_cap - last_alerted_cap) / last_alerted_cap >= 0.01:
+            if abs(current_market_cap - last_alerted_cap) / last_alerted_cap >= 0.05:
                 direction = "up" if current_market_cap > last_alerted_cap else "down"
                 percentage_change = ((current_market_cap - last_alerted_cap) / last_alerted_cap) * 100
                 message = (
